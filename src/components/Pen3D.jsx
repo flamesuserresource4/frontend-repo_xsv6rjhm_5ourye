@@ -1,9 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { motion, useScroll, useTransform } from 'framer-motion'
+import { motion, useScroll, useTransform, useSpring, useMotionValue } from 'framer-motion'
 
-// A 3D-styled pen with a glowing trail that reacts to scroll.
-// - Sticky stage: as you scroll through the section, the pen rotates and "draws" a neon curve.
-// - No external 3D deps; uses perspective and layered gradients for a holographic feel.
+// A 3D-styled pen with a glowing trail that reacts to scroll and mouse.
+// Enhancements:
+// - Mouse-reactive tilt/parallax and tip glow following cursor
+// - Ink color shifts by scroll section (purple -> blue -> aqua)
+// - Reduced-motion mode with gentler rendering
+// - Mobile polish: fewer particles, lighter glows, DPR-aware canvas
+// - Performance: memoized drawing, RAF-timed updates, throttled on reduced motion
 
 export default function Pen3D() {
   const sectionRef = useRef(null)
@@ -13,90 +17,161 @@ export default function Pen3D() {
 
   // Map scroll progress to transforms
   const rotZ = useTransform(scrollYProgress, [0, 1], [-25, 35])
-  const rotX = useTransform(scrollYProgress, [0, 1], [12, -18])
-  const rotY = useTransform(scrollYProgress, [0, 1], [-10, 15])
-  const penX = useTransform(scrollYProgress, [0, 1], [-80, 120])
-  const penY = useTransform(scrollYProgress, [0, 1], [40, -60])
+  const rotXBase = useTransform(scrollYProgress, [0, 1], [12, -18])
+  const rotYBase = useTransform(scrollYProgress, [0, 1], [-10, 15])
+  const penXBase = useTransform(scrollYProgress, [0, 1], [-80, 120])
+  const penYBase = useTransform(scrollYProgress, [0, 1], [40, -60])
+
+  // Mouse parallax
+  const mx = useMotionValue(0)
+  const my = useMotionValue(0)
+  const rotXMouse = useSpring(useTransform(my, [-0.5, 0.5], [8, -8]), { stiffness: 120, damping: 18 })
+  const rotYMouse = useSpring(useTransform(mx, [-0.5, 0.5], [-10, 10]), { stiffness: 120, damping: 18 })
+  const penXMouse = useSpring(useTransform(mx, [-0.5, 0.5], [-30, 30]), { stiffness: 140, damping: 20 })
+  const penYMouse = useSpring(useTransform(my, [-0.5, 0.5], [-20, 20]), { stiffness: 140, damping: 20 })
+
+  const rotX = useTransform([rotXBase, rotXMouse], ([a, b]) => a + b)
+  const rotY = useTransform([rotYBase, rotYMouse], ([a, b]) => a + b)
+  const penX = useTransform([penXBase, penXMouse], ([a, b]) => a + b)
+  const penY = useTransform([penYBase, penYMouse], ([a, b]) => a + b)
+
+  const [prefs, setPrefs] = useState({ reduced: false, particles: 40, dpr: 1, glow: 1 })
+
+  useEffect(() => {
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const isMobile = window.innerWidth < 768
+    const dpr = Math.min(window.devicePixelRatio || 1, reduced ? 1 : isMobile ? 1.25 : 2)
+    setPrefs({
+      reduced,
+      particles: reduced ? 10 : isMobile ? 18 : 40,
+      dpr,
+      glow: reduced ? 0.5 : isMobile ? 0.8 : 1,
+    })
+  }, [])
 
   const [dims, setDims] = useState({ w: 0, h: 0 })
-  
+
   useEffect(() => {
     const resize = () => {
       const el = sectionRef.current
       const canvas = canvasRef.current
       if (!el || !canvas) return
-      const rect = el.getBoundingClientRect()
-      // Use window size for a consistent drawing area inside the sticky panel
       const w = Math.min(window.innerWidth, 1400)
       const h = Math.min(window.innerHeight, 900)
-      canvas.width = w
-      canvas.height = h
+      // Style size (CSS pixels)
+      canvas.style.width = w + 'px'
+      canvas.style.height = h + 'px'
+      // Internal buffer with DPR scaling
+      const bw = Math.floor(w * prefs.dpr)
+      const bh = Math.floor(h * prefs.dpr)
+      if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw
+        canvas.height = bh
+      }
       setDims({ w, h })
     }
     resize()
     window.addEventListener('resize', resize)
     return () => window.removeEventListener('resize', resize)
-  }, [])
+  }, [prefs.dpr])
 
-  // Draw a smooth neon curve that extends with scroll progress
+  // Color interpolation helpers
+  const lerp = (a, b, t) => a + (b - a) * t
+  const hsl = (h, s, l, a = 1) => `hsla(${h}, ${s}%, ${l}%, ${a})`
+  function segmentColor(p) {
+    // 0-0.5: magenta(285,90,55) -> blue(210,100,60), 0.5-1: blue -> aqua(170,95,60)
+    if (p <= 0.5) {
+      const t = p / 0.5
+      const h = lerp(285, 210, t)
+      const s = lerp(90, 100, t)
+      const l = lerp(55, 60, t)
+      return { core: hsl(h, s, l, 0.95), glow1: hsl(h, s, l, 0.35), glow2: hsl(h, s, l, 0.22) }
+    } else {
+      const t = (p - 0.5) / 0.5
+      const h = lerp(210, 170, t)
+      const s = lerp(100, 95, t)
+      const l = lerp(60, 60, t)
+      return { core: hsl(h, s, l, 0.95), glow1: hsl(h, s, l, 0.35), glow2: hsl(h, s, l, 0.22) }
+    }
+  }
+
+  // Draw neon curve with particles; adapt to DPR
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')
+    ctx.scale(prefs.dpr, prefs.dpr)
 
     let raf
+    let last = 0
 
-    const draw = () => {
-      const w = canvas.width
-      const h = canvas.height
+    const draw = (ts = 0) => {
+      const w = dims.w
+      const h = dims.h
+      if (!w || !h) { raf = requestAnimationFrame(draw); return }
 
-      // Background subtle grid glow
-      ctx.clearRect(0, 0, w, h)
+      const p = scrollYProgress.get()
+
+      // Throttle if reduced motion
+      const minDelta = prefs.reduced ? 1000 / 24 : 0
+      if (ts - last < minDelta) { raf = requestAnimationFrame(draw); return }
+      last = ts
+
+      // Clear background
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      // Reset scaling per DPR for drawing in CSS pixels
+      ctx.setTransform(prefs.dpr, 0, 0, prefs.dpr, 0, 0)
+
+      // Background gradient glow
       const grd = ctx.createLinearGradient(0, 0, w, h)
-      grd.addColorStop(0, 'rgba(120, 0, 255, 0.08)')
-      grd.addColorStop(1, 'rgba(0, 220, 255, 0.06)')
+      grd.addColorStop(0, 'rgba(120, 0, 255, 0.07)')
+      grd.addColorStop(1, 'rgba(0, 220, 255, 0.05)')
       ctx.fillStyle = grd
       ctx.fillRect(0, 0, w, h)
 
-      // Read progress value from MotionValue
-      const p = scrollYProgress.get()
-
-      // Path control points evolve with progress to create an elegant S-curve
+      // Path control points evolve with progress
       const start = { x: w * 0.15, y: h * 0.75 }
       const cp1 = { x: w * (0.25 + p * 0.15), y: h * (0.2 + p * 0.15) }
       const cp2 = { x: w * (0.55 + p * 0.25), y: h * (0.85 - p * 0.45) }
       const end = { x: w * (0.75 + p * 0.15), y: h * (0.35 - p * 0.15) }
 
-      // Glow layers
+      const cols = segmentColor(p)
+      const glowScale = prefs.glow
+
       const drawStroke = (width, color, shadowBlur) => {
         ctx.beginPath()
         ctx.moveTo(start.x, start.y)
         ctx.bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, end.x, end.y)
         ctx.lineWidth = width
         ctx.strokeStyle = color
-        ctx.shadowBlur = shadowBlur
+        ctx.shadowBlur = shadowBlur * glowScale
         ctx.shadowColor = color
         ctx.lineCap = 'round'
         ctx.lineJoin = 'round'
         ctx.stroke()
       }
 
-      drawStroke(12, 'rgba(0, 255, 255, 0.25)', 24)
-      drawStroke(8, 'rgba(120, 0, 255, 0.35)', 28)
-      drawStroke(3, 'rgba(0, 255, 200, 0.9)', 18)
+      // Glow layers (order: outer glows, then core)
+      drawStroke(12, cols.glow2, 24)
+      drawStroke(8, cols.glow1, 28)
+      drawStroke(3, cols.core, 16)
 
       // Particles along the path
-      for (let i = 0; i < 40; i++) {
-        const t = Math.max(0, Math.min(1, p * 1.1 - i * 0.02))
-        const x = bezierPoint(start.x, cp1.x, cp2.x, end.x, t)
-        const y = bezierPoint(start.y, cp1.y, cp2.y, end.y, t)
-        const s = 1 + (1 - t) * 3
-        ctx.beginPath()
-        ctx.fillStyle = `rgba(${Math.floor(80 + 80 * (1 - t))}, ${Math.floor(255 - 80 * t)}, 255, ${0.6 - t * 0.5})`
-        ctx.shadowBlur = 16
-        ctx.shadowColor = 'rgba(0,255,255,0.8)'
-        ctx.arc(x, y, s, 0, Math.PI * 2)
-        ctx.fill()
+      const N = prefs.particles
+      if (N > 0) {
+        for (let i = 0; i < N; i++) {
+          const t = Math.max(0, Math.min(1, p * 1.1 - i * (1 / N)))
+          const x = bezierPoint(start.x, cp1.x, cp2.x, end.x, t)
+          const y = bezierPoint(start.y, cp1.y, cp2.y, end.y, t)
+          const s = 1 + (1 - t) * 3
+          ctx.beginPath()
+          ctx.fillStyle = cols.core
+          ctx.shadowBlur = 16 * glowScale
+          ctx.shadowColor = cols.core
+          ctx.arc(x, y, s, 0, Math.PI * 2)
+          ctx.fill()
+        }
       }
 
       raf = requestAnimationFrame(draw)
@@ -104,7 +179,7 @@ export default function Pen3D() {
 
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
-  }, [scrollYProgress])
+  }, [scrollYProgress, dims.w, dims.h, prefs])
 
   // Helper for cubic Bezier evaluation
   function bezierPoint(p0, p1, p2, p3, t) {
@@ -119,6 +194,28 @@ export default function Pen3D() {
     }),
     []
   )
+
+  // Mouse handling inside sticky stage
+  useEffect(() => {
+    const stage = sectionRef.current
+    if (!stage) return
+
+    const onMove = (e) => {
+      const rect = stage.getBoundingClientRect()
+      const x = (e.clientX - rect.left) / rect.width
+      const y = (e.clientY - rect.top) / rect.height
+      mx.set(x - 0.5)
+      my.set(y - 0.5)
+    }
+    const onLeave = () => { mx.set(0); my.set(0) }
+
+    stage.addEventListener('mousemove', onMove)
+    stage.addEventListener('mouseleave', onLeave)
+    return () => {
+      stage.removeEventListener('mousemove', onMove)
+      stage.removeEventListener('mouseleave', onLeave)
+    }
+  }, [mx, my])
 
   return (
     <section ref={sectionRef} className="relative z-10">
@@ -179,8 +276,14 @@ export default function Pen3D() {
                       '0 0 16px rgba(0,255,200,0.8), 0 0 40px rgba(0,255,255,0.35)'
                   }}
                 />
-                {/* Tip light */}
-                <div className="absolute -bottom-2 left-1/2 h-4 w-4 -translate-x-1/2 rounded-full bg-cyan-300/80 blur-[2px]" />
+                {/* Tip light follows cursor subtly */}
+                <motion.div
+                  className="absolute -bottom-2 left-1/2 h-4 w-4 -translate-x-1/2 rounded-full bg-cyan-300/80 blur-[2px]"
+                  style={{
+                    x: useTransform(mx, v => v * 8),
+                    y: useTransform(my, v => v * -6),
+                  }}
+                />
               </div>
             </div>
           </div>
